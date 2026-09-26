@@ -105,7 +105,21 @@ public class TelemetryParser {
         short sessionTypeCode = (short) Byte.toUnsignedInt(buffer.get()); // uint8
         short trackIdCode = buffer.get(); // int8 (signed) - do NOT use an unsigned conversion here
 
-        return new F1SessionData(F1Appendix.sessionType(sessionTypeCode), F1Appendix.track(trackIdCode));
+        // Skip: formula(1) + sessionTimeLeft(2) + sessionDuration(2) + pitSpeedLimit(1) + gamePaused(1)
+        //     + isSpectating(1) + spectatorCarIndex(1) + sliProNativeSupport(1) + numMarshalZones(1) = 11 bytes
+        buffer.position(buffer.position() + 11);
+        // Skip: m_marshalZones[21] (MarshalZone = float + int8 = 5 bytes each) = 105 bytes
+        buffer.position(buffer.position() + 21 * 5);
+        // Skip: safetyCarStatus(1) + networkGame(1) + numWeatherForecastSamples(1) = 3 bytes
+        buffer.position(buffer.position() + 3);
+        // Skip: m_weatherForecastSamples[64] (WeatherForecastSample = 8 bytes each) = 512 bytes
+        buffer.position(buffer.position() + 64 * 8);
+        // Skip: forecastAccuracy(1) + aiDifficulty(1) + seasonLinkIdentifier(4) = 6 bytes
+        buffer.position(buffer.position() + 6);
+
+        long weekendId = Integer.toUnsignedLong(buffer.getInt()); // m_weekendLinkIdentifier (uint32)
+
+        return new F1SessionData(F1Appendix.sessionType(sessionTypeCode), F1Appendix.track(trackIdCode), weekendId);
     }
 
     public F1EventData parseEventData(byte[] payload) {
@@ -114,6 +128,7 @@ public class TelemetryParser {
 
         F1Header header = parseHeader(payload);
 
+        buffer.position(HEADER_SIZE); // event string code starts right after the header
         byte[] eventCodeBytes = new byte[4];
         buffer.get(eventCodeBytes);
         String eventCode = new String(eventCodeBytes, StandardCharsets.US_ASCII);

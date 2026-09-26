@@ -11,12 +11,17 @@ import org.springframework.integration.ip.dsl.UdpInboundChannelAdapterSpec;
 import org.springframework.messaging.Message;
 import org.springframework.messaging.support.MessageBuilder;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 @Configuration
 public class UDPConfig {
 
     private final int port;
     private final String bindAddress;
     private final TelemetryParser parser;
+    // Fires once per app run so we can tell "no UDP arriving" apart from
+    // "arriving but dropped downstream" without spamming the console per-packet.
+    private final AtomicBoolean firstPacketSeen = new AtomicBoolean(false);
 
     public UDPConfig(TelemetryParser parser,
                       @Value("${udp.telemetry.port:20777}") int port,
@@ -32,6 +37,10 @@ public class UDPConfig {
                 .transform(Message.class, message -> {
                     byte[] payload = (byte[]) message.getPayload();
                     F1Header header = parser.parseHeader(payload);
+                    if (firstPacketSeen.compareAndSet(false, true)) {
+                        System.out.println("UDP telemetry alive: first packet received (packetId="
+                                + header.m_packetId() + ", " + payload.length + " bytes)");
+                    }
                     return MessageBuilder.withPayload(payload)
                             .setHeader("packetId", header.m_packetId())
                             .build();

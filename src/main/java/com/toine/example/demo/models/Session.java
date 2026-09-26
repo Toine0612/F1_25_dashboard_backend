@@ -21,6 +21,9 @@ public class Session {
     @Column(name = "track", nullable = false)
     private String track; // e.g. "Monaco" - see F1Appendix
 
+    @Column(name = "weekend_id", nullable = false)
+    private long weekendId; // m_weekendLinkIdentifier - shared by every session in the same race weekend
+
     protected Session() {}
 
     public Long getSessionId() {
@@ -33,5 +36,9 @@ public class Session {
 
     public String getTrack() {
         return track;
+    }
+
+    public long getWeekendId() {
+        return weekendId;
     }
 }

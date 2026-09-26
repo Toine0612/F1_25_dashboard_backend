@@ -117,25 +117,20 @@ public class TelemetryService {
                     long rewindedFrame = rewind.frameIdentifier();
                     short current_lap = telemetryData.lastKey();
 
-                    System.out.println("Rewinded frame: " + rewindedFrame);
 
                     ConcurrentSkipListMap<Long, TelemetrySample> currentLapFrames = telemetryData.get(current_lap);
-                    System.out.println("Current lap total frames: " + currentLapFrames.size());
                     if (currentLapFrames != null) {
                         Long lapFirstFrame = currentLapFrames.firstKey();
 
                         // Check current and previous lap since rewind cannot go further back
                         if (lapFirstFrame > rewindedFrame) {
                             ConcurrentSkipListMap<Long, TelemetrySample> previousLapFrames = telemetryData.get(current_lap - 1);
-                            System.out.println("Previous lap total frames: " + previousLapFrames.size());
                             if (previousLapFrames != null) {
                                 previousLapFrames.tailMap(rewindedFrame).clear();
-                                System.out.println("New previous lap total frames: " + previousLapFrames.size());
                             }
                         }
 
                         currentLapFrames.tailMap(rewindedFrame).clear();
-                        System.out.println("New current lap total frames: " + currentLapFrames.size());
                     }
 
                     frameBuffer.tailMap(rewindedFrame).clear();
@@ -180,12 +175,6 @@ public class TelemetryService {
         lastDriverStatus = driverStatus;
     }
 
-    @ServiceActivator(inputChannel = "sessionChanel")
-    public void processSessionData(byte[] payload) {
-        if (session_id == 0) return;
-        lastSessionData = telemetryParser.parseSessionData(payload);
-    }
-
     @ServiceActivator(inputChannel = "telemetryChanel")
     public void processTelemetryData(byte[] payload) {
         if (session_id == 0) return;
@@ -198,6 +187,12 @@ public class TelemetryService {
         }
 
         pairFrame(header.m_frameIdentifier(), null, carTelemetryPacket);
+    }
+
+    @ServiceActivator(inputChannel = "sessionChanel")
+    public void processSessionData(byte[] payload) {
+        if (session_id == 0) return;
+        lastSessionData = telemetryParser.parseSessionData(payload);
     }
 
     // Used for determining when a lap finishes and flushing the data to the DB
@@ -240,6 +235,10 @@ public class TelemetryService {
         frameBuffer.remove(frame);
 
         if (completedLap.currentLapNum() == 0) return;
+
+        // m_lapDistance is negative until the car has actually crossed the start/finish line
+        // (garage idle, out-lap tail) - never attribute that pre-line window to a stored lap.
+        if (completedLap.lapDistance() < 0) return;
 
         TelemetrySample sample = new TelemetrySample(frame, completedTelemetry, completedLap);
         telemetryData.computeIfAbsent(completedLap.currentLapNum(), k -> new ConcurrentSkipListMap<>())

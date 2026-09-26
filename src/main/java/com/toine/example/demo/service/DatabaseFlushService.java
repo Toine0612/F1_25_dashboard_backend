@@ -38,7 +38,7 @@ public class DatabaseFlushService {
         System.out.println("Async thread [" + Thread.currentThread().getName() + "] flushing " + sampleCount + " records for lap " + lap_number + ".");
 
         try {
-            sessionRepository.upsertSession(sessionId, sessionData.sessionType(), sessionData.track());
+            sessionRepository.upsertSession(sessionId, sessionData.sessionType(), sessionData.track(), sessionData.weekendId());
             Session session = sessionRepository.getReferenceById(sessionId);
 
             Boolean isValid = (lapHistory.m_lapValidBitFlags() & 0x01) != 0;

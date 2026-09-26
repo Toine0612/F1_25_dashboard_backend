@@ -24,7 +24,7 @@ public class UdpTelemetrySimulator {
 
     private static final String HOST = "127.0.0.1";
     private static final int PORT = 20777;
-    private static final long SESSION_UID = 123456789012345L;
+    private static final long SESSION_UID_BASE = 123456789012345L;
     private static final float TRACK_LENGTH_M = 1000f;
     private static final int LAP_DURATION_MS = 60_000;
     private static final int LAPDATA_PACKETS_PER_LAP = 60; // ~1000ms of simulated time per packet
@@ -37,81 +37,103 @@ public class UdpTelemetrySimulator {
     private static final int LONG_SECTOR1_MS = 35_000;
     private static final int SECTOR2_MS = 20_000;
 
+    // Session type / track codes - see F1Appendix / the F1 25 UDP spec appendix.
+    private static final short SESSION_TYPE_PRACTICE_1 = 1;
+    private static final short SESSION_TYPE_RACE = 15;
+    private static final short SESSION_TYPE_TIME_TRIAL = 18;
+    private static final short TRACK_MONACO = 5;
+    private static final short TRACK_SILVERSTONE = 7;
+
     public static void main(String[] args) throws IOException, InterruptedException {
         try (DatagramSocket socket = new DatagramSocket()) {
             InetAddress address = InetAddress.getByName(HOST);
 
-            System.out.println("Sending SSTA event for session " + SESSION_UID + " ...");
-            send(socket, address, buildEventPacket("SSTA", 0f));
-            Thread.sleep(50);
+            // Two sessions sharing one weekendId (a "race weekend": Practice 1 -> Race at Monaco),
+            // plus one standalone session with its own unique weekendId (a Time Trial at Silverstone) -
+            // exercises the frontend's weekend-grouping (shared weekendId groups sessions; a session
+            // whose weekendId matches nothing else renders as its own standalone card).
+            long weekendId = 42;
+            runSession(socket, address, SESSION_UID_BASE, SESSION_TYPE_PRACTICE_1, TRACK_MONACO, weekendId);
+            runSession(socket, address, SESSION_UID_BASE + 1, SESSION_TYPE_RACE, TRACK_MONACO, weekendId);
+            runSession(socket, address, SESSION_UID_BASE + 2, SESSION_TYPE_TIME_TRIAL, TRACK_SILVERSTONE, 999);
 
-            int frame = 0;
-            int[] lapTimesMs = new int[LAPS_TO_SIMULATE + 1];
+            System.out.println("Done. Lap " + LAPS_TO_SIMULATE + " left in progress in each session (never flushed) - "
+                    + "a pre-existing, accepted gap for the last lap of a session.");
+        }
+    }
 
-            for (byte lapNum = 1; lapNum <= LAPS_TO_SIMULATE; lapNum++) {
-                System.out.println("Simulating lap " + lapNum + " ...");
+    private static void runSession(DatagramSocket socket, InetAddress address, long sessionUid,
+                                    short sessionTypeCode, short trackIdCode, long weekendId) throws IOException, InterruptedException {
+        System.out.println("Sending SSTA event for session " + sessionUid + " ...");
+        send(socket, address, buildEventPacket(sessionUid, "SSTA", 0f));
+        Thread.sleep(50);
 
-                // Completion data for the PREVIOUS lap becomes known on the packet right after
-                // the lap-number transition (not on the transition packet itself) - see the plan's
-                // TelemetryService.processLapData confirmation logic.
-                boolean justTransitioned = true;
-                int previousLapLastLapTimeMs = LAP_DURATION_MS; // scripted: every lap takes 60s
-                int sector1Ms = LONG_SECTOR1_MS;
-                int sector2Ms = SECTOR2_MS;
+        send(socket, address, buildSessionPacket(sessionUid, sessionTypeCode, trackIdCode, weekendId));
+        Thread.sleep(15);
 
-                for (int i = 0; i < LAPDATA_PACKETS_PER_LAP; i++) {
-                    int currentLapTimeMs = (int) ((long) i * LAP_DURATION_MS / LAPDATA_PACKETS_PER_LAP);
-                    float lapDistance = TRACK_LENGTH_M * i / LAPDATA_PACKETS_PER_LAP;
-                    float sessionTime = frame * 0.02f;
+        int frame = 0;
+        int[] lapTimesMs = new int[LAPS_TO_SIMULATE + 1];
 
-                    int lastLapTimeMs = 0;
-                    int s1 = 0;
-                    int s2 = 0;
-                    if (lapNum > 1 && !justTransitioned) {
-                        // Confirming packet (and every one after, until the next transition)
-                        lastLapTimeMs = previousLapLastLapTimeMs;
-                        s1 = sector1Ms;
-                        s2 = sector2Ms;
-                    }
+        for (byte lapNum = 1; lapNum <= LAPS_TO_SIMULATE; lapNum++) {
+            System.out.println("Simulating lap " + lapNum + " ...");
 
-                    // 255 = not set yet (spec sentinel); once lap 1 completes, the game reports
-                    // which lap the fastest speed trap was recorded on.
-                    int speedTrapFastestLap = lapNum == 1 ? 255 : (lapNum - 1);
+            // Completion data for the PREVIOUS lap becomes known on the packet right after
+            // the lap-number transition (not on the transition packet itself) - see the plan's
+            // TelemetryService.processLapData confirmation logic.
+            boolean justTransitioned = true;
+            int previousLapLastLapTimeMs = LAP_DURATION_MS; // scripted: every lap takes 60s
+            int sector1Ms = LONG_SECTOR1_MS;
+            int sector2Ms = SECTOR2_MS;
 
-                    send(socket, address, buildLapDataPacket(
-                            sessionTime, currentLapTimeMs, lapDistance, lapNum,
-                            lastLapTimeMs, s1, s2, (byte) 0, speedTrapFastestLap));
-                    justTransitioned = false;
+            for (int i = 0; i < LAPDATA_PACKETS_PER_LAP; i++) {
+                int currentLapTimeMs = (int) ((long) i * LAP_DURATION_MS / LAPDATA_PACKETS_PER_LAP);
+                float lapDistance = TRACK_LENGTH_M * i / LAPDATA_PACKETS_PER_LAP;
+                float sessionTime = frame * 0.02f;
 
-                    for (int t = 0; t < TELEMETRY_PACKETS_PER_LAPDATA; t++) {
-                        double lapFraction = lapDistance / TRACK_LENGTH_M;
-                        boolean brakingZone = (lapFraction > 0.28 && lapFraction < 0.35)
-                                || (lapFraction > 0.68 && lapFraction < 0.75);
-
-                        short speed = brakingZone ? (short) 90 : (short) 280;
-                        float throttle = brakingZone ? 0f : 1f;
-                        float brake = brakingZone ? 1f : 0f;
-                        // Hard braking pushes tyre surface temp past 127 (uint8 sign-flip threshold);
-                        // spec allows up to 255 and real tyres do exceed 127C under heavy braking.
-                        int tyreSurfaceTemp = brakingZone ? 145 : 90;
-
-                        send(socket, address, buildCarTelemetryPacket(sessionTime, speed, throttle, brake, tyreSurfaceTemp));
-                        frame++;
-                    }
-
-                    Thread.sleep(15);
+                int lastLapTimeMs = 0;
+                int s1 = 0;
+                int s2 = 0;
+                if (lapNum > 1 && !justTransitioned) {
+                    // Confirming packet (and every one after, until the next transition)
+                    lastLapTimeMs = previousLapLastLapTimeMs;
+                    s1 = sector1Ms;
+                    s2 = sector2Ms;
                 }
 
-                lapTimesMs[lapNum] = LAP_DURATION_MS;
+                // 255 = not set yet (spec sentinel); once lap 1 completes, the game reports
+                // which lap the fastest speed trap was recorded on.
+                int speedTrapFastestLap = lapNum == 1 ? 255 : (lapNum - 1);
 
-                // Session History (packet ID 11) is what actually confirms a lap to the backend
-                // and drives TelemetryService.processSesionHistory's flush logic.
-                send(socket, address, buildSessionHistoryPacket(lapNum, lapTimesMs));
+                send(socket, address, buildLapDataPacket(
+                        sessionUid, sessionTime, currentLapTimeMs, lapDistance, lapNum,
+                        lastLapTimeMs, s1, s2, (byte) 0, speedTrapFastestLap));
+                justTransitioned = false;
+
+                for (int t = 0; t < TELEMETRY_PACKETS_PER_LAPDATA; t++) {
+                    double lapFraction = lapDistance / TRACK_LENGTH_M;
+                    boolean brakingZone = (lapFraction > 0.28 && lapFraction < 0.35)
+                            || (lapFraction > 0.68 && lapFraction < 0.75);
+
+                    short speed = brakingZone ? (short) 90 : (short) 280;
+                    float throttle = brakingZone ? 0f : 1f;
+                    float brake = brakingZone ? 1f : 0f;
+                    // Hard braking pushes tyre surface temp past 127 (uint8 sign-flip threshold);
+                    // spec allows up to 255 and real tyres do exceed 127C under heavy braking.
+                    int tyreSurfaceTemp = brakingZone ? 145 : 90;
+
+                    send(socket, address, buildCarTelemetryPacket(sessionUid, sessionTime, speed, throttle, brake, tyreSurfaceTemp));
+                    frame++;
+                }
+
                 Thread.sleep(15);
             }
 
-            System.out.println("Done. Lap " + LAPS_TO_SIMULATE + " left in progress (never flushed) - "
-                    + "a pre-existing, accepted gap for the last lap of a session.");
+            lapTimesMs[lapNum] = LAP_DURATION_MS;
+
+            // Session History (packet ID 11) is what actually confirms a lap to the backend
+            // and drives TelemetryService.processSesionHistory's flush logic.
+            send(socket, address, buildSessionHistoryPacket(sessionUid, lapNum, lapTimesMs));
+            Thread.sleep(15);
         }
     }
 
@@ -124,14 +146,18 @@ public class UdpTelemetrySimulator {
         return buffer;
     }
 
-    private static void writeHeader(ByteBuffer buffer, short packetId, float sessionTime) {
+    private static void putZeros(ByteBuffer buffer, int count) {
+        buffer.put(new byte[count]);
+    }
+
+    private static void writeHeader(ByteBuffer buffer, long sessionUid, short packetId, float sessionTime) {
         buffer.putShort((short) 2025);      // m_packetFormat
         buffer.put((byte) 25);              // m_gameYear
         buffer.put((byte) 1);               // m_gameMajorVersion
         buffer.put((byte) 0);               // m_gameMinorVersion
         buffer.put((byte) 1);               // m_packetVersion
         buffer.put((byte) packetId);        // m_packetId
-        buffer.putLong(SESSION_UID);        // m_sessionUID
+        buffer.putLong(sessionUid);         // m_sessionUID
         buffer.putFloat(sessionTime);       // m_sessionTime
         buffer.putInt(0);                   // m_frameIdentifier
         buffer.putInt(0);                   // m_overallFrameIdentifier
@@ -139,19 +165,56 @@ public class UdpTelemetrySimulator {
         buffer.put((byte) 0xFF);            // m_secondaryPlayerCarIndex (255 = no second player, the normal case)
     }
 
-    private static byte[] buildEventPacket(String eventCode, float sessionTime) {
+    private static byte[] buildEventPacket(long sessionUid, String eventCode, float sessionTime) {
         byte[] codeBytes = eventCode.getBytes(StandardCharsets.US_ASCII);
         ByteBuffer buffer = newBuffer(codeBytes.length);
-        writeHeader(buffer, (short) 3, sessionTime);
+        writeHeader(buffer, sessionUid, (short) 3, sessionTime);
         buffer.put(codeBytes);
         return buffer.array();
     }
 
-    private static byte[] buildLapDataPacket(float sessionTime, int currentLapTimeMs, float lapDistance,
+    /**
+     * Packet ID 1 (Session) - only built out through m_weekendLinkIdentifier, since that's
+     * all TelemetryParser.parseSessionData reads. Everything in between is zero-filled but
+     * still present at the correct byte offsets, so the parser's skip-by-size jumps land
+     * exactly where the real fields would be.
+     */
+    private static byte[] buildSessionPacket(long sessionUid, short sessionTypeCode, short trackIdCode, long weekendId) {
+        int bodySize = 8   // weather, trackTemperature, airTemperature, totalLaps, trackLength, sessionType, trackId (up to and incl. trackId = 8 bytes)
+                + 11        // formula..numMarshalZones
+                + 21 * 5    // m_marshalZones[21]
+                + 3         // safetyCarStatus, networkGame, numWeatherForecastSamples
+                + 64 * 8    // m_weatherForecastSamples[64]
+                + 6         // forecastAccuracy, aiDifficulty, seasonLinkIdentifier
+                + 4;        // weekendLinkIdentifier
+
+        ByteBuffer buffer = newBuffer(bodySize);
+        writeHeader(buffer, sessionUid, (short) 1, 0f);
+
+        buffer.put((byte) 0);                // m_weather
+        buffer.put((byte) 20);               // m_trackTemperature
+        buffer.put((byte) 25);               // m_airTemperature
+        buffer.put((byte) 0);                // m_totalLaps
+        buffer.putShort((short) 0);          // m_trackLength
+        buffer.put((byte) sessionTypeCode);  // m_sessionType
+        buffer.put((byte) trackIdCode);      // m_trackId
+
+        putZeros(buffer, 11);                // formula..numMarshalZones
+        putZeros(buffer, 21 * 5);            // m_marshalZones[21]
+        putZeros(buffer, 3);                 // safetyCarStatus, networkGame, numWeatherForecastSamples
+        putZeros(buffer, 64 * 8);            // m_weatherForecastSamples[64]
+        putZeros(buffer, 2);                 // forecastAccuracy, aiDifficulty
+        buffer.putInt(0);                    // m_seasonLinkIdentifier
+        buffer.putInt((int) weekendId);      // m_weekendLinkIdentifier
+
+        return buffer.array();
+    }
+
+    private static byte[] buildLapDataPacket(long sessionUid, float sessionTime, int currentLapTimeMs, float lapDistance,
                                               byte currentLapNum, int lastLapTimeMs, int sector1Ms, int sector2Ms,
                                               byte currentLapInvalid, int speedTrapFastestLap) {
         ByteBuffer buffer = newBuffer(57);
-        writeHeader(buffer, (short) 2, sessionTime);
+        writeHeader(buffer, sessionUid, (short) 2, sessionTime);
 
         buffer.putInt(lastLapTimeMs);                 // lastLapTimeInMS
         buffer.putInt(currentLapTimeMs);               // currentLapTimeInMS
@@ -190,10 +253,10 @@ public class UdpTelemetrySimulator {
         return buffer.array();
     }
 
-    private static byte[] buildCarTelemetryPacket(float sessionTime, short speed, float throttle, float brake,
-                                                   int tyreSurfaceTemp) {
+    private static byte[] buildCarTelemetryPacket(long sessionUid, float sessionTime, short speed, float throttle,
+                                                   float brake, int tyreSurfaceTemp) {
         ByteBuffer buffer = newBuffer(60);
-        writeHeader(buffer, (short) 6, sessionTime);
+        writeHeader(buffer, sessionUid, (short) 6, sessionTime);
 
         buffer.putShort(speed);       // speed
         buffer.putFloat(throttle);    // throttle
@@ -235,14 +298,14 @@ public class UdpTelemetrySimulator {
      * confirm laps and trigger flushes. m_numLaps is the count of laps with data so far
      * (including the current in-progress one), i.e. completedLaps + 1.
      */
-    private static byte[] buildSessionHistoryPacket(int completedLaps, int[] lapTimesMs) {
+    private static byte[] buildSessionHistoryPacket(long sessionUid, int completedLaps, int[] lapTimesMs) {
         int numLaps = completedLaps + 1; // + current in-progress lap
         int lapHistorySize = 14; // 4 + 2 + 1 + 2 + 1 + 2 + 1 + 1
         int tyreStintSize = 3;
         int bodySize = 7 + (numLaps * lapHistorySize) + (8 * tyreStintSize);
 
         ByteBuffer buffer = newBuffer(bodySize);
-        writeHeader(buffer, (short) 11, 0f);
+        writeHeader(buffer, sessionUid, (short) 11, 0f);
 
         buffer.put((byte) 0);              // m_carIdx (matches m_playerCarIndex in header)
         buffer.put((byte) numLaps);        // m_numLaps
