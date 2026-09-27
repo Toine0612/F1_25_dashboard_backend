@@ -1,5 +1,7 @@
 package com.toine.example.demo.models;
 
+import java.util.Optional;
+
 /**
  * The telemetry channels recorded for every lap. Each is stored as one array per lap (see
  * {@link LapChannel}); all arrays of a lap are index-aligned, one entry per recorded frame.
@@ -40,10 +42,11 @@ public enum Channel {
         return integral;
     }
 
-    public static Channel fromKey(String key) {
+    /** Empty for a key this version doesn't record (any more), so stored laps survive a channel being removed. */
+    public static Optional<Channel> find(String key) {
         for (Channel channel : values()) {
-            if (channel.key.equals(key)) return channel;
+            if (channel.key.equals(key)) return Optional.of(channel);
         }
-        throw new IllegalArgumentException("Unknown telemetry channel: " + key);
+        return Optional.empty();
     }
 }

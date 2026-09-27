@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
@@ -43,6 +44,9 @@ class TelemetryPipelineIntegrationTest {
 
     @Autowired
     private MockMvcTester mvc;
+
+    @Autowired
+    private JdbcClient jdbc;
 
     private final JsonMapper json = JsonMapper.builder().build();
 
@@ -88,6 +92,14 @@ class TelemetryPipelineIntegrationTest {
 
         JsonNode speedOnly = get("/api/laps/" + lapId + "/telemetry?channels=distance,speed");
         assertThat(speedOnly.get("channels").propertyNames()).containsExactly("distance", "speed");
+
+        // A channel this version doesn't know (e.g. stored by an older build) is left out instead of failing
+        jdbc.sql("insert into f1.lap_channel (lap_id, channel, samples) values (?, 'retiredChannel', array[1.0]::real[])")
+                .param(lapId)
+                .update();
+        JsonNode withUnknownChannel = get("/api/laps/" + lapId + "/telemetry");
+        assertThat(withUnknownChannel.get("channels").has("retiredChannel")).isFalse();
+        assertThat(withUnknownChannel.get("channels").has("speed")).isTrue();
 
         JsonNode live = get("/api/live");
         assertThat(live.get("packetsReceived").asLong()).isGreaterThan(10_000);

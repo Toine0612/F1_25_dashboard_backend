@@ -102,10 +102,12 @@ public class DashboardController {
                 ? lapChannelRepository.findByLapId(lapId)
                 : lapChannelRepository.findByLapIdAndChannelIn(lapId, channels);
 
+        // Channels this version doesn't know (e.g. recorded by an older or newer build) are left out
         Map<String, Object> values = new LinkedHashMap<>();
         stored.stream()
-                .sorted((a, b) -> a.getChannel().compareTo(b.getChannel()))
-                .forEach(channel -> values.put(channel.getChannel().key(), jsonValues(channel)));
+                .flatMap(row -> row.getChannel().map(channel -> Map.entry(channel, row)).stream())
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> values.put(entry.getKey().key(), jsonValues(entry.getKey(), entry.getValue())));
         return new LapTelemetryView(lapId, lap.getSampleCount(), values);
     }
 
@@ -123,9 +125,9 @@ public class DashboardController {
                 status.lapNumber(), status.lapDistance(), status.lapsSaved());
     }
 
-    private static Object jsonValues(LapChannel channel) {
-        float[] samples = channel.getSamples();
-        if (!channel.getChannel().integral()) return samples;
+    private static Object jsonValues(Channel channel, LapChannel row) {
+        float[] samples = row.getSamples();
+        if (!channel.integral()) return samples;
         int[] whole = new int[samples.length];
         Arrays.setAll(whole, i -> Math.round(samples[i]));
         return whole;

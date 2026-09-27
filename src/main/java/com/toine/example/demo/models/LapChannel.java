@@ -3,6 +3,7 @@ package com.toine.example.demo.models;
 import jakarta.persistence.*;
 
 import java.io.Serializable;
+import java.util.Optional;
 
 /** One telemetry channel of one lap, stored as a single array - see the V1 migration. */
 @Entity
@@ -35,8 +36,9 @@ public class LapChannel {
         return lapId;
     }
 
-    public Channel getChannel() {
-        return Channel.fromKey(channel);
+    /** Empty if the stored channel isn't one this version knows - see {@link Channel#find}. */
+    public Optional<Channel> getChannel() {
+        return Channel.find(channel);
     }
 
     public float[] getSamples() {
