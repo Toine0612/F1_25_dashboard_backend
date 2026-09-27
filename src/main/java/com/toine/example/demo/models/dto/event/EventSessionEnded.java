@@ -1,3 +1,4 @@
 package com.toine.example.demo.models.dto.event;
 
-public record EventSessionEnded () implements EventDetails {}
+/** "SEND" - sent when a session ends. */
+public record EventSessionEnded() implements EventDetails {}

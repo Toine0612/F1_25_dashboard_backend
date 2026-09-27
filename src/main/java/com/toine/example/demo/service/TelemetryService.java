@@ -1,272 +1,150 @@
 package com.toine.example.demo.service;
 
-import com.toine.example.demo.models.dto.*;
-import com.toine.example.demo.models.dto.event.EventRewind;
+import com.toine.example.demo.models.dto.event.EventFlashback;
 import com.toine.example.demo.models.dto.event.EventSessionEnded;
 import com.toine.example.demo.models.dto.event.EventSessionStarted;
-import com.toine.example.demo.models.dto.packets.*;
-import com.toine.example.demo.models.dto.sessionHistory.LapHistory;
-import com.toine.example.demo.repository.LapRepository;
-import com.toine.example.demo.repository.SessionRepository;
-import com.toine.example.demo.repository.TelemetryRepository;
-import org.springframework.beans.factory.annotation.Qualifier;
+import com.toine.example.demo.models.dto.packets.F1EventData;
+import com.toine.example.demo.models.dto.packets.F1Header;
+import com.toine.example.demo.models.dto.packets.F1SessionHistory;
+import com.toine.example.demo.models.SessionUids;
+import com.toine.example.demo.service.recording.FrameAssembler;
+import com.toine.example.demo.service.recording.FrameSample;
+import com.toine.example.demo.service.recording.LapRecorder;
+import com.toine.example.demo.service.recording.LapSink;
+import com.toine.example.demo.service.recording.RecorderStatus;
+import com.toine.example.demo.service.recording.SessionInfo;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.integration.annotation.ServiceActivator;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Service;
 
-import java.util.NavigableMap;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.Executor;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * INFO
- * Only Completed laps and in laps are stored. (in laps give detail in crashes) (out laps have no value)
+ * Entry point for decoded UDP packets (see UDPConfig): picks out the player's car, joins the per-frame
+ * packets and feeds the {@link LapRecorder}. Packets arrive one at a time, in the order received.
  */
-
 @Service
 public class TelemetryService {
 
-    private final SessionRepository sessionRepository;
-    private final LapRepository lapRepository;
-    private final TelemetryRepository telemetryRepository;
-    private final TelemetryParser telemetryParser;
-    private final DatabaseFlushService databaseFlushService;
-    private final Executor ioDatabaseExecutor;
+    /** Message header carrying the already-decoded {@link F1Header}. */
+    public static final String F1_HEADER = "f1Header";
 
-    // Use volatile to ensure all threads see the most up-to-date value instantly
-    private volatile long session_id = 0;
+    private static final Logger log = LoggerFactory.getLogger(TelemetryService.class);
 
-    // Last lap-data packet seen, used only to detect lap transitions/rewinds
-    private volatile long lastReceivedFrame = -1;
-    private volatile short next_lap_flush = 0;
+    private final TelemetryParser parser;
+    private final LapRecorder recorder;
+    private final FrameAssembler frames = new FrameAssembler();
 
-    // Previous lap-data packet's driver status, used to detect the *transition* into the garage
-    // (a pit stop / end of session) rather than firing on every packet while already parked.
-    private volatile short lastDriverStatus = -1; // -1 = not yet observed this session
+    private final AtomicLong packetsReceived = new AtomicLong();
+    private final AtomicLong packetsRejected = new AtomicLong();
+    private final Set<String> reportedRejections = ConcurrentHashMap.newKeySet();
+    private volatile Instant lastPacketAt;
 
-    private volatile F1SessionHistory lastSessionHistory;
-    private volatile F1SessionData lastSessionData;
-
-    // A lock to prevent multiple threads from mutating the lap state at the same time
-    private final Object stateLock = new Object();
-
-    private static final class FrameEntry {
-        F1LapData lap;
-        F1CarTelemetry telemetry;
-    }
-    private final NavigableMap<Long, FrameEntry> frameBuffer = new ConcurrentSkipListMap<>();
-
-    private final ConcurrentSkipListMap<Short, ConcurrentSkipListMap<Long, TelemetrySample>> telemetryData = new ConcurrentSkipListMap<>();
-
-    public TelemetryService(TelemetryParser parser,
-                            SessionRepository sessionRepository,
-                            LapRepository lapRepository,
-                            TelemetryRepository telemetryRepository,
-                            DatabaseFlushService databaseFlushService,
-                            @Qualifier("ioDatabaseExecutor") Executor ioDatabaseExecutor) {
-        this.telemetryParser = parser;
-        this.sessionRepository = sessionRepository;
-        this.lapRepository = lapRepository;
-        this.telemetryRepository = telemetryRepository;
-        this.databaseFlushService = databaseFlushService;
-        this.ioDatabaseExecutor = ioDatabaseExecutor;
+    public TelemetryService(TelemetryParser parser, LapSink lapSink) {
+        this.parser = parser;
+        this.recorder = new LapRecorder(lapSink, Clock.systemUTC());
     }
 
-    @ServiceActivator(inputChannel = "eventChanel")
-    public void processEventData(byte[] payload) {
-        F1EventData eventData = telemetryParser.parseEventData(payload);
-        if (eventData == null || eventData.eventDetails() == null) return;
+    /** Filters out packets that can't be decoded; each distinct problem is logged once. */
+    public boolean accept(byte[] payload) {
+        if (packetsReceived.getAndIncrement() == 0) {
+            log.info("UDP telemetry is arriving ({} byte first packet)", payload.length);
+        }
+        lastPacketAt = Instant.now();
 
-        switch (eventData.eventDetails()) {
-            case EventSessionStarted startedSession -> {
-                synchronized (stateLock) {
-                    session_id = startedSession.session_id();
-                    telemetryData.clear();
-                    frameBuffer.clear();
-                    lastSessionHistory = null;
-                    lastSessionData = null;
-                    next_lap_flush = 0;
-                    lastDriverStatus = -1;
-                    System.out.println("Session started cleanly: " + session_id);
-                }
-            }
+        String problem = parser.validate(payload);
+        if (problem == null) return true;
 
-            case EventSessionEnded endedSession -> {
-                synchronized (stateLock) {
-                    if (lastSessionHistory == null) return;
-                    System.out.println("Session ended");
-                    short current_lap_number = lastSessionHistory.m_numLaps();
+        packetsRejected.incrementAndGet();
+        if (reportedRejections.add(problem)) {
+            log.warn("Ignoring UDP packets: {}", problem);
+        }
+        return false;
+    }
 
-                    // Flush lap N-1 and N (last lap + current (un)finished lap)
-                    for (short l = (short) (current_lap_number - 1); l <= current_lap_number; l++) {
-                        flushLap(lastSessionHistory, l);
-                    }
+    @ServiceActivator(inputChannel = "motionChannel")
+    public void onMotion(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        if (!hasPlayerCar(header)) return;
+        record(header, frames.add(header.frameIdentifier(), parser.parseCarMotion(payload, header.playerCarIndex())));
+    }
 
-                    session_id = 0;
-                    telemetryData.clear();
-                    frameBuffer.clear();
-                    next_lap_flush = 0;
-                    lastDriverStatus = -1;
-                    lastSessionData = null;
-                }
-            }
+    @ServiceActivator(inputChannel = "lapDataChannel")
+    public void onLapData(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        if (!hasPlayerCar(header)) return;
+        record(header, frames.add(header.frameIdentifier(), parser.parseLapData(payload, header.playerCarIndex())));
+    }
 
-            case EventRewind rewind -> {
-                synchronized (stateLock) {
-                    if (telemetryData.isEmpty()) return;
+    @ServiceActivator(inputChannel = "carTelemetryChannel")
+    public void onCarTelemetry(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        if (!hasPlayerCar(header)) return;
+        record(header, frames.add(header.frameIdentifier(), parser.parseCarTelemetry(payload, header.playerCarIndex())));
+    }
 
-                    long rewindedFrame = rewind.frameIdentifier();
-                    short current_lap = telemetryData.lastKey();
+    @ServiceActivator(inputChannel = "sessionChannel")
+    public void onSession(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        recorder.onSessionInfo(header.sessionUid(), SessionInfo.from(parser.parseSessionData(payload)));
+    }
 
-
-                    ConcurrentSkipListMap<Long, TelemetrySample> currentLapFrames = telemetryData.get(current_lap);
-                    if (currentLapFrames != null) {
-                        Long lapFirstFrame = currentLapFrames.firstKey();
-
-                        // Check current and previous lap since rewind cannot go further back
-                        if (lapFirstFrame > rewindedFrame) {
-                            ConcurrentSkipListMap<Long, TelemetrySample> previousLapFrames = telemetryData.get(current_lap - 1);
-                            if (previousLapFrames != null) {
-                                previousLapFrames.tailMap(rewindedFrame).clear();
-                            }
-                        }
-
-                        currentLapFrames.tailMap(rewindedFrame).clear();
-                    }
-
-                    frameBuffer.tailMap(rewindedFrame).clear();
-                }
-            }
-
-            default -> {
-                return;
-            }
+    @ServiceActivator(inputChannel = "sessionHistoryChannel")
+    public void onSessionHistory(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        F1SessionHistory history = parser.parseSessionHistory(payload);
+        // The game cycles through every car's history; only the player's matters here.
+        if (history.carIdx() == header.playerCarIndex()) {
+            recorder.onSessionHistory(header.sessionUid(), history);
         }
     }
 
-    @ServiceActivator(inputChannel = "lapDataChanel")
-    public void processLapData(byte[] payload) {
-        if (session_id == 0) return;
-
-        F1Header header = telemetryParser.parseHeader(payload);
-        F1LapData lapDataPacket = telemetryParser.parseLapData(payload, header.m_playerCarIndex());
-
-        synchronized (stateLock) {
-            lastReceivedFrame = header.m_frameIdentifier();
-        }
-
-        pairFrame(header.m_frameIdentifier(), lapDataPacket, null);
-
-        short driverStatus = lapDataPacket.driverStatus();
-
-        // Flush laps N-1 and N (last lap + in lap) the instant the car returns to the garage
-        // (pit stop or end of session) - only on the transition from on-track (1-4) to garage (0),
-        // never while already sitting in the garage (e.g. before ever leaving it at session start).
-        if (driverStatus == 0 && lastDriverStatus > 0) {
-            if (lastSessionHistory != null) {
-                short current_lap_number = lastSessionHistory.m_numLaps();
-
-                // Flush lap N-1 and N
-                for (short l = (short) (current_lap_number - 1); l <= current_lap_number; l++) {
-                    flushLap(lastSessionHistory, l);
-                }
+    @ServiceActivator(inputChannel = "eventChannel")
+    public void onEvent(@Header(F1_HEADER) F1Header header, byte[] payload) {
+        F1EventData event = parser.parseEventData(payload);
+        switch (event.eventDetails()) {
+            case EventSessionStarted started -> log.info("Session {} started", SessionUids.format(header.sessionUid()));
+            case EventSessionEnded ended -> {
+                log.info("Session {} ended", SessionUids.format(header.sessionUid()));
+                recorder.onSessionEnded(header.sessionUid());
             }
-        }
-
-        lastDriverStatus = driverStatus;
-    }
-
-    @ServiceActivator(inputChannel = "telemetryChanel")
-    public void processTelemetryData(byte[] payload) {
-        if (session_id == 0) return;
-
-        F1Header header = telemetryParser.parseHeader(payload);
-        F1CarTelemetry carTelemetryPacket = telemetryParser.parseCarTelemetry(payload, header.m_playerCarIndex());
-
-        synchronized (stateLock) {
-            lastReceivedFrame = header.m_frameIdentifier();
-        }
-
-        pairFrame(header.m_frameIdentifier(), null, carTelemetryPacket);
-    }
-
-    @ServiceActivator(inputChannel = "sessionChanel")
-    public void processSessionData(byte[] payload) {
-        if (session_id == 0) return;
-        lastSessionData = telemetryParser.parseSessionData(payload);
-    }
-
-    // Used for determining when a lap finishes and flushing the data to the DB
-    @ServiceActivator(inputChannel = "sessionHistoryChanel")
-    public void processSesionHistory(byte[] payload) {
-        if (session_id == 0) return;
-
-        F1Header header = telemetryParser.parseHeader(payload);
-        F1SessionHistory sessionHistory = telemetryParser.parseSessionHistory(payload);
-        if (header.m_playerCarIndex() != sessionHistory.m_carIdx()) return; // Only get data from current user
-
-        lastSessionHistory = sessionHistory;
-
-        short current_lap_number = sessionHistory.m_numLaps();
-
-        synchronized (stateLock) {
-            if (next_lap_flush == 0) {
-                next_lap_flush = (short) Math.max(1, current_lap_number);
-            }
-
-            if ((current_lap_number - next_lap_flush) >= 2) {
-                System.out.println("Flush lap N-1");
-                flushLap(sessionHistory, next_lap_flush);
-            }
+            // Nothing to do: the frame identifier goes back after a flashback, which the recorder
+            // detects on the next frame - that also works if this event packet gets lost.
+            case EventFlashback flashback -> log.debug("Flashback to frame {}", flashback.frameIdentifier());
+            case null -> { }
         }
     }
 
-    private void pairFrame(long frame, F1LapData lap, F1CarTelemetry telemetry) {
-        FrameEntry entry = frameBuffer.computeIfAbsent(frame, f -> new FrameEntry());
-
-        F1LapData completedLap;
-        F1CarTelemetry completedTelemetry;
-        synchronized (entry) {
-            if (lap != null) entry.lap = lap;
-            if (telemetry != null) entry.telemetry = telemetry;
-            if (entry.lap == null || entry.telemetry == null) return;
-            completedLap = entry.lap;
-            completedTelemetry = entry.telemetry;
-        }
-        frameBuffer.remove(frame);
-
-        if (completedLap.currentLapNum() == 0) return;
-
-        // m_lapDistance is negative until the car has actually crossed the start/finish line
-        // (garage idle, out-lap tail) - never attribute that pre-line window to a stored lap.
-        if (completedLap.lapDistance() < 0) return;
-
-        TelemetrySample sample = new TelemetrySample(frame, completedTelemetry, completedLap);
-        telemetryData.computeIfAbsent(completedLap.currentLapNum(), k -> new ConcurrentSkipListMap<>())
-                .computeIfAbsent(frame, f -> sample);
+    public RecorderStatus recorderStatus() {
+        return recorder.status();
     }
 
-    private void flushLap(F1SessionHistory sessionHistory, short lap_number) {
-        if (lap_number <= 0) return;
+    public Instant lastPacketAt() {
+        return lastPacketAt;
+    }
 
-        synchronized (stateLock) {
-            ConcurrentSkipListMap<Long, TelemetrySample> telemetryToFlush = telemetryData.remove(lap_number);
-            LapHistory lapHistory = sessionHistory.lapHistoryData().get(lap_number - 1); // -1 for array index
-            if (telemetryToFlush == null || telemetryToFlush.isEmpty() || lapHistory == null) return;
+    public long packetsReceived() {
+        return packetsReceived.get();
+    }
 
-            // Stored data must not come from garage, and out laps
-            TelemetrySample lastTelemetrySample = telemetryToFlush.lastEntry().getValue();
-            short driverStatus = lastTelemetrySample.lapData().driverStatus();
-            if (driverStatus != 0 || (lapHistory.m_sector1TimeMSPart() == 0 && lapHistory.m_sector2TimeMSPart() == 0)) {
-                F1SessionData sessionData = lastSessionData;
-                databaseFlushService.flushTelemetryDataAsync(session_id, sessionData, lap_number, lapHistory, telemetryToFlush);
-            } else {
-                System.out.println("Discarding incomplete Lap: " + lap_number);
-            }
+    public long packetsRejected() {
+        return packetsRejected.get();
+    }
 
-            // Delete all buffers with frames that are lower than or equal to the last frame of the lap
-            frameBuffer.headMap(lastTelemetrySample.frame(), true).clear();
+    @PreDestroy
+    void shutdown() {
+        recorder.close();
+    }
 
-            next_lap_flush = (short) (lap_number + 1);
-        }
+    private void record(F1Header header, Optional<FrameSample> sample) {
+        sample.ifPresent(s -> recorder.onSample(header.sessionUid(), s));
+    }
+
+    /** 255 while spectating: there is no player car to record. */
+    private static boolean hasPlayerCar(F1Header header) {
+        return header.playerCarIndex() < TelemetryParser.MAX_CARS;
     }
 }

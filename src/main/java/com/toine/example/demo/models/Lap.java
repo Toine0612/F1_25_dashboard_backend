@@ -1,38 +1,55 @@
 package com.toine.example.demo.models;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.toine.example.demo.service.recording.LapTiming;
 import jakarta.persistence.*;
 
+import java.time.Instant;
+
 @Entity
+@Table(name = "lap")
 public class Lap {
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @JsonIgnore
     @ManyToOne(optional = false, fetch = FetchType.LAZY)
-    @JoinColumn(name = "session_id")
+    @JoinColumn(name = "session_uid")
     private Session session;
 
-    private short currentLapNum;
-
-    private Long lastLapTimeMs;
-    private Integer sector1TimeMs;
-    private Integer sector2TimeMs;
-    private Integer sector3TimeMs;
-    private Boolean lapValid;
+    private int lapNumber;
+    private int lapTimeMs;
+    @Column(name = "sector1_ms")
+    private Integer sector1Ms;
+    @Column(name = "sector2_ms")
+    private Integer sector2Ms;
+    @Column(name = "sector3_ms")
+    private Integer sector3Ms;
+    private boolean valid;
+    private boolean pitIn;          // lap ended in the pit lane
+    private boolean pitOut;         // lap started in the pit lane
+    private int sampleCount;
+    private Instant recordedAt;
 
     protected Lap() {}
 
-    public Lap(Session session, short currentLapNum, Long lastLapTimeMs,
-               Integer sector1TimeMs, Integer sector2TimeMs, Integer sector3TimeMs, Boolean lapValid) {
+    public Lap(Session session, int lapNumber, LapTiming timing, boolean pitIn, boolean pitOut,
+               int sampleCount, Instant recordedAt) {
         this.session = session;
-        this.currentLapNum = currentLapNum;
-        this.lastLapTimeMs = lastLapTimeMs;
-        this.sector1TimeMs = sector1TimeMs;
-        this.sector2TimeMs = sector2TimeMs;
-        this.sector3TimeMs = sector3TimeMs;
-        this.lapValid = lapValid;
+        this.lapNumber = lapNumber;
+        this.pitIn = pitIn;
+        this.pitOut = pitOut;
+        this.sampleCount = sampleCount;
+        this.recordedAt = recordedAt;
+        setTiming(timing);
+    }
+
+    public void setTiming(LapTiming timing) {
+        this.lapTimeMs = timing.lapTimeMs();
+        this.sector1Ms = timing.sector1Ms();
+        this.sector2Ms = timing.sector2Ms();
+        this.sector3Ms = timing.sector3Ms();
+        this.valid = timing.valid();
     }
 
     public Long getId() {
@@ -43,47 +60,43 @@ public class Lap {
         return session;
     }
 
-    public short getCurrentLapNum() {
-        return currentLapNum;
+    public int getLapNumber() {
+        return lapNumber;
     }
 
-    public Long getLastLapTimeMs() {
-        return lastLapTimeMs;
+    public int getLapTimeMs() {
+        return lapTimeMs;
     }
 
-    public void setLastLapTimeMs(Long lastLapTimeMs) {
-        this.lastLapTimeMs = lastLapTimeMs;
+    public Integer getSector1Ms() {
+        return sector1Ms;
     }
 
-    public Integer getSector1TimeMs() {
-        return sector1TimeMs;
+    public Integer getSector2Ms() {
+        return sector2Ms;
     }
 
-    public void setSector1TimeMs(Integer sector1TimeMs) {
-        this.sector1TimeMs = sector1TimeMs;
+    public Integer getSector3Ms() {
+        return sector3Ms;
     }
 
-    public Integer getSector2TimeMs() {
-        return sector2TimeMs;
+    public boolean isValid() {
+        return valid;
     }
 
-    public void setSector2TimeMs(Integer sector2TimeMs) {
-        this.sector2TimeMs = sector2TimeMs;
+    public boolean isPitIn() {
+        return pitIn;
     }
 
-    public Integer getSector3TimeMs() {
-        return sector3TimeMs;
+    public boolean isPitOut() {
+        return pitOut;
     }
 
-    public void setSector3TimeMs(Integer sector3TimeMs) {
-        this.sector3TimeMs = sector3TimeMs;
+    public int getSampleCount() {
+        return sampleCount;
     }
 
-    public Boolean getLapValid() {
-        return lapValid;
-    }
-
-    public void setLapValid(Boolean lapValid) {
-        this.lapValid = lapValid;
+    public Instant getRecordedAt() {
+        return recordedAt;
     }
 }
